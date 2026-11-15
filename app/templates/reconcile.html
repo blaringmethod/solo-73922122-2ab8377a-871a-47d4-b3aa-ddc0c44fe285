@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>刷卡按趟归站 · 班车数据平台</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="wrap">
+    <h1>刷卡按趟归站</h1>
+    <p class="tagline">按趟号把刷卡流水关联到确定停靠事实 · 两组输入分别版本化，更正即停供旧表</p>
+    <nav class="nav">
+      <a class="link" href="/reconcile">归站工作台</a>
+      <a class="link" href="/">原停靠事实分析</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  {% if error %}
+  <section class="alert" role="alert">
+    <h2>输入被拒收</h2>
+    <p class="alert-message">{{ error.message }}</p>
+    {% if error.details %}
+    <ul class="alert-details">
+      {% for item in error.details %}<li>{{ item }}</li>{% endfor %}
+    </ul>
+    {% endif %}
+    <p class="muted">本次上传未受理，已保存的输入版本与归站结果保持原样，未发生任何改变。</p>
+  </section>
+  {% endif %}
+
+  {% if notice %}
+  <section class="alert notice" role="status">
+    <h2>操作已受理</h2>
+    <p class="alert-message">{{ notice }}</p>
+  </section>
+  {% endif %}
+
+  <section class="card">
+    <h2>当前状态</h2>
+    <div class="stats">
+      <div class="stat {% if state.has_station_position %}ok{% endif %}">
+        <span class="num">{{ state.station_position.version if state.station_position else '—' }}</span>
+        <span class="lbl">站点+定位版本</span>
+      </div>
+      <div class="stat {% if state.has_swipe %}ok{% endif %}">
+        <span class="num">{{ state.swipe.version if state.swipe else '—' }}</span>
+        <span class="lbl">刷卡版本</span>
+      </div>
+      <div class="stat {% if state.download_available %}ok{% elif state.pending_recalc %}warn{% endif %}">
+        <span class="num">
+          {% if not state.has_station_position or not state.has_swipe %}待上传
+          {% elif state.job %}{{ state.job.status_label }}
+          {% else %}待重算{% endif %}
+        </span>
+        <span class="lbl">重算状态</span>
+      </div>
+      <div class="stat {% if state.download_available %}ok{% else %}warn{% endif %}">
+        <span class="num">{{ '开放' if state.download_available else '停供' }}</span>
+        <span class="lbl">下载</span>
+      </div>
+    </div>
+
+    {% if state.job %}
+    <p class="muted small">
+      当前作业 #{{ state.job.id }}：站点定位 v{{ state.job.station_position_version }}
+      × 刷卡 v{{ state.job.swipe_version }} · 状态 {{ state.job.status_label }}
+      · 已尝试 {{ state.job.attempts }} 次
+      {% if state.job.last_error %}<br>最近错误：{{ state.job.last_error }}{% endif %}
+    </p>
+    {% if state.pending_recalc %}
+    <p class="muted small">重算期间仍可继续受理两组输入的更正；仅当两组最新已受理输入的完整重算成功后才恢复下载。</p>
+    {% endif %}
+    {% endif %}
+
+    <div class="actions">
+      <a class="button {% if not state.download_available %}disabled{% endif %}"
+         href="/api/reconcile/download"
+         {% if not state.download_available %}aria-disabled="true" onclick="return false;"{% endif %}>
+        下载当前归站表 CSV
+      </a>
+      <form method="post" action="/reconcile/retry" style="display:inline">
+        <button type="submit" class="secondary">立即重试/推进重算</button>
+      </form>
+      <a class="link" href="/reconcile" data-refresh>刷新状态</a>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>第一组：站点 + 定位（整组更正）</h2>
+    <p class="muted small">
+      站点列：站名, 纬度, 经度, 半径米；定位列：趟号, 时刻UTC, 纬度, 经度（同趟时刻严格递增，最多 40 点）。
+      两个文件作为一组同时受理；任一份非法则整组拒收。
+      <a class="link" href="/samples/stations.csv" download>站点样例</a> ·
+      <a class="link" href="/samples/trip_positions.csv" download>带趟号定位样例</a>
+    </p>
+    <form method="post" action="/reconcile/upload/station-position" enctype="multipart/form-data">
+      <div class="grid">
+        <label class="drop">
+          <span class="drop-title">站点 CSV</span>
+          <input name="station_file" type="file" accept=".csv,text/csv" required>
+        </label>
+        <label class="drop">
+          <span class="drop-title">定位 CSV（含趟号）</span>
+          <input name="position_file" type="file" accept=".csv,text/csv" required>
+        </label>
+      </div>
+      <div class="actions">
+        <button type="submit">{{ '受理更正并停供旧表' if state.has_station_position else '首次上传站点+定位' }}</button>
+      </div>
+    </form>
+    {% if state.station_position %}
+    <p class="muted small">
+      当前版本 v{{ state.station_position.version }}，受理于 {{ state.station_position.accepted_at }}：
+      {% for f in state.station_position.files %}{{ f.filename }}（{{ f.byte_size }} B）{% if not loop.last %} · {% endif %}{% endfor %}
+    </p>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>第二组：刷卡流水（整份更正）</h2>
+    <p class="muted small">
+      列：流水号（唯一）, 趟号, 时刻UTC；最多 100 条。流水号重复、趟号为空或时刻无法解析均拒收。
+      <a class="link" href="/samples/swipes.csv" download>刷卡样例</a>
+    </p>
+    <form method="post" action="/reconcile/upload/swipe" enctype="multipart/form-data">
+      <label class="drop">
+        <span class="drop-title">刷卡 CSV</span>
+        <input name="swipe_file" type="file" accept=".csv,text/csv" required>
+      </label>
+      <div class="actions">
+        <button type="submit">{{ '受理更正并停供旧表' if state.has_swipe else '首次上传刷卡流水' }}</button>
+      </div>
+    </form>
+    {% if state.swipe %}
+    <p class="muted small">
+      当前版本 v{{ state.swipe.version }}，受理于 {{ state.swipe.accepted_at }}：
+      {% for f in state.swipe.files %}{{ f.filename }}（{{ f.byte_size }} B）{% if not loop.last %} · {% endif %}{% endfor %}
+    </p>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>归站规则</h2>
+    <ul class="rules-list">
+      <li>定位按趟号分组，逐趟复用停靠事实求解；仅状态为“事实”的确定停靠参与归站。</li>
+      <li>刷卡时刻落在某确定停靠的到站—离站<b>闭区间</b>（含两端）内才归该站，同趟事实区间互不相交。</li>
+      <li>趟号无定位、该趟无确定事实、或时刻不在任何闭区间内，一律标记<b>未匹配</b>并写明原因。</li>
+      <li>下载列含流水号、趟号、刷卡时刻、站序、站名、匹配状态、原因及两组输入版本号。</li>
+      <li>只有对应两组<b>最新已受理</b>输入的完整成功结果才开放下载；迟到计算结果自动丢弃，不覆盖当前表。</li>
+      <li>计算失败保持停供并回到重试队列；进程重启后自动接续未完成的重算。</li>
+    </ul>
+  </section>
+
+  <section class="card">
+    <h2>最近重算作业</h2>
+    {% if jobs %}
+    <table class="compact">
+      <thead><tr><th>#</th><th>站点定位版本</th><th>刷卡版本</th><th>状态</th><th>尝试</th><th>更新时间</th></tr></thead>
+      <tbody>
+        {% for job in jobs %}
+        <tr>
+          <td>{{ job.id }}</td>
+          <td>v{{ job.station_position_version }}</td>
+          <td>v{{ job.swipe_version }}</td>
+          <td>{{ job.status }}</td>
+          <td>{{ job.attempts }}</td>
+          <td>{{ job.updated_at }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="muted">尚无作业：两组输入首次齐全后会自动创建重算作业。</p>
+    {% endif %}
+  </section>
+</main>
+</body>
+</html>

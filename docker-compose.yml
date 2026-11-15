@@ -1,13 +1,16 @@
 services:
-  bus-stop-facts:
+  bus-stop-facts-a:
     build: .
-    image: bus-stop-facts:1.0.0
-    container_name: bus-stop-facts
+    image: bus-stop-facts:2.0.0
+    container_name: bus-stop-facts-a
     ports:
       - "8000:8000"
     environment:
       TZ: UTC
       PYTHONDONTWRITEBYTECODE: "1"
+      BUS_RECONCILE_DB: /srv/data/reconcile.db
+    volumes:
+      - reconcile-data:/srv/data
     restart: unless-stopped
     read_only: true
     tmpfs:
@@ -24,3 +27,35 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  bus-stop-facts-b:
+    build: .
+    image: bus-stop-facts:2.0.0
+    container_name: bus-stop-facts-b
+    ports:
+      - "8001:8000"
+    environment:
+      TZ: UTC
+      PYTHONDONTWRITEBYTECODE: "1"
+      BUS_RECONCILE_DB: /srv/data/reconcile.db
+    volumes:
+      - reconcile-data:/srv/data
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  reconcile-data:

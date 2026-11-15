@@ -1,8 +1,10 @@
-"""FastAPI 应用：上传两路 CSV、校验、求解、展示与导出。"""
+"""FastAPI 应用：上传两路 CSV、校验、求解、展示与导出；按趟号刷卡归站。"""
 
 from __future__ import annotations
 
 import logging
+import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, Request, UploadFile
@@ -12,17 +14,58 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from . import reconcile_api
 from .analysis import analyze
 from .models import MAX_REQUEST_BYTES, InputError
 from .parsing import parse_inputs
+from .storage import Storage
+from .worker import RecalcWorker
 
 BASE_DIR = Path(__file__).resolve().parent
 SAMPLES_DIR = BASE_DIR / "samples"
 logger = logging.getLogger("bus_stop.facts")
 
-app = FastAPI(title="班车停靠事实", version="1.0.0", docs_url=None, redoc_url=None)
-app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+# 归站流程的 SQLite 数据库位置：两个容器实例挂载同一个数据卷共享该文件。
+# 惰性解析环境变量，便于测试在启动前切换临时库。
+DEFAULT_DB_PATH = str(BASE_DIR / "data" / "reconcile.db")
+
+
+def resolve_db_path() -> str:
+    return os.environ.get("BUS_RECONCILE_DB", DEFAULT_DB_PATH)
+
+
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    store = Storage(resolve_db_path())
+    recalc_worker = RecalcWorker(store)
+    reconcile_api.storage = store
+    reconcile_api.worker = recalc_worker
+    reconcile_api.templates = templates
+    # 启动即接续：claim 时会把残留 running 作业重新排队
+    recalc_worker.start()
+    logger.info("归站模块已启动，数据库：%s", resolve_db_path())
+    try:
+        yield
+    finally:
+        recalc_worker.stop()
+
+
+app = FastAPI(
+    title="班车停靠事实",
+    version="2.0.0",
+    docs_url=None,
+    redoc_url=None,
+    lifespan=lifespan,
+)
+app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+app.include_router(reconcile_api.router)
 
 
 @app.exception_handler(InputError)
@@ -87,6 +130,8 @@ async def healthz() -> dict:
 _SAMPLE_FILES = {
     "stations.csv": ("stations.csv", "text/csv; charset=utf-8"),
     "positions.csv": ("positions.csv", "text/csv; charset=utf-8"),
+    "trip_positions.csv": ("trip_positions.csv", "text/csv; charset=utf-8"),
+    "swipes.csv": ("swipes.csv", "text/csv; charset=utf-8"),
 }
 
 

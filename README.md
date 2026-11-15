@@ -1,7 +1,15 @@
-# 班车停靠事实
+# 班车停靠事实与刷卡按趟归站
 
-把一趟班车的 GPS 定位点整理成“按站停靠”的到站 / 离站事实，供刷卡数据按站关联。
-提供可直接用 Docker Compose 启动的操作网页。
+把一趟班车的 GPS 定位点整理成“按站停靠”的到站 / 离站事实，并把刷卡流水按**趟号**
+关联到确定停靠事实。提供可直接用 Docker Compose 启动的操作网页，包含两个
+共享同一 SQLite 数据库的对等实例。
+
+## 功能入口
+
+| 入口 | 说明 |
+| --- | --- |
+| `/` | 原“停靠事实分析”上传页（保留，逻辑不变） |
+| `/reconcile` | **刷卡按趟归站工作台**（新）：两组输入版本化、异步重算、结果下载 |
 
 ## 快速开始
 
@@ -9,8 +17,12 @@
 docker compose up --build
 ```
 
-打开 <http://localhost:8000> ，分别上传**站点 CSV** 与**定位 CSV**，点击“生成停靠事实”。
-页面右上角或首页可下载样例文件。
+- 实例 A：<http://localhost:8000>
+- 实例 B：<http://localhost:8001>
+
+两个实例挂载同一个命名数据卷（`reconcile-data` → `/srv/data/reconcile.db`），
+通过 SQLite WAL + 行级认领协同工作：在任一实例上传/更正，另一实例立即可见，
+重算作业只会被其中一个实例执行。
 
 停止服务：
 
@@ -19,6 +31,13 @@ docker compose down
 ```
 
 > 健康检查：`GET /healthz` 返回 `{"ok": true}`；容器带 `HEALTHCHECK`，以非 root 用户运行。
+
+---
+
+# 一、停靠事实分析（原入口）
+
+打开 <http://localhost:8000/> ，分别上传**站点 CSV** 与**定位 CSV**，点击“生成停靠事实”。
+页面右上角或首页可下载样例文件。
 
 ## 输入格式
 
@@ -106,6 +125,107 @@ docker compose down
 `bad_number`、`out_of_range`、`bad_time`、`time_not_increasing`、
 `too_many_stops`、`too_many_points`、`no_dwell`、`unsupported_file`。
 
+---
+
+# 二、刷卡按趟归站（新）
+
+打开 <http://localhost:8000/reconcile>。定位更正后旧归站表立即失效，系统以
+**两组独立版本化输入 + 异步重算作业**保证不会继续使用旧表。
+
+## 两组输入
+
+| 输入组 | 文件 | 版本化方式 |
+| --- | --- | --- |
+| 站点+定位组 | 站点 CSV、**带趟号**定位 CSV | 两个文件作为一组，整份更正，共享一个版本号 |
+| 刷卡组 | 刷卡 CSV | 单独整份更正，独立版本号 |
+
+### 带趟号定位 CSV
+
+| 列 | 含义 | 说明 |
+| --- | --- | --- |
+| 趟号 | 班次/车次标识 | 不能为空 |
+| 时刻 | UTC 时刻 | ISO-8601；**同一趟号内**严格递增，跨趟互不影响 |
+| 纬度 / 经度 | 定位坐标 | 同原分析入口 |
+
+总行数最多 **40** 行。站点 CSV 格式与原入口一致（最多 6 站）。
+
+### 刷卡 CSV
+
+| 列 | 含义 | 说明 |
+| --- | --- | --- |
+| 流水号 | 唯一流水标识 | 文件内**必须唯一**，不能为空 |
+| 趟号 | 与定位的趟号对应 | 不能为空 |
+| 时刻 | UTC 时刻 | ISO-8601 |
+
+最多 **100** 条。表头兼容常见中英文写法（`transaction_id/trip_id/time`、
+`交易流水号/班次号/时刻UTC` 等），无表头时按固定列序解析。
+
+## 归站规则
+
+1. 定位按趟号分组，每趟独立复用停靠事实求解；**只有状态为“事实”的确定停靠**
+   参与归站（待核/未停靠不产生闭区间）。
+2. 刷卡时刻落在某确定停靠的**到站—离站闭区间**（含两个端点）内才归该站；
+   事实区间按线路顺序互不相交，一条流水最多命中一个站。
+3. 以下情况一律标记 **未匹配** 并在“未匹配原因”列说明：
+   - 刷卡趟号在定位中不存在；
+   - 该趟没有任何确定停靠事实；
+   - 时刻不在任何确定停靠闭区间内。
+
+## 版本、停供与重算语义
+
+- **首次上传**：分别提交站点+定位组与刷卡组；两组齐全后自动创建重算作业。
+- **整份更正**：之后任一组都可整份替换。受理在同一数据库事务内完成：
+  新输入版本落库的同时登记引用“两组最新版本”的新作业，旧下载**立即停供**，
+  页面显示“待重算”。
+- **重算期间可继续更正**：每次更正都登记新的目标作业；worker 按队列处理。
+- **开放下载的唯一条件**：当前作业 `succeeded`，且它引用的仍是两组**最新已受理**
+  版本并有关联行。其余状态（待重算/重算中/失败/过时）一律返回 `409` 停供。
+- **迟到计算不覆盖**：作业完成时若发现输入已被更新，结果直接丢弃，
+  作业标记为“已完成但结果丢弃”，绝不写入关联表、绝不影响当前可下载结果。
+- **非法输入拒收**：所有解析校验在写库之前完成，任一文件非法返回 `422`，
+  已保存的版本、作业与结果**完全不变**。
+- **失败可重试**：计算抛错时作业回到队列并记录错误，下载保持停供；
+  worker 自动重试，也可在页面点“立即重试/推进重算”或调重试接口。
+- **重启自动接续**：running 作业带 60 秒租约；worker 崩溃或进程重启后，
+  租约过期（或为空）的 running 作业会被重新排队认领，不会丢失。
+
+### 下载内容
+
+`GET /api/reconcile/download`（UTF-8 BOM CSV，文件名 `swipe_stop_associations.csv`）：
+
+| 列 | 说明 |
+| --- | --- |
+| 流水号、趟号、刷卡时刻UTC | 来自刷卡输入 |
+| 站序、站名 | 命中的确定停靠（未匹配为空） |
+| 关联状态 | 已匹配 / 未匹配 |
+| 未匹配原因 | 未匹配时的具体原因 |
+| 站点定位输入版本、刷卡输入版本 | 该行结果对应的两组输入版本号 |
+
+## 归站 HTTP 接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/reconcile` | 归站工作台页面（纯 HTML 表单可操作，不依赖 JS） |
+| POST | `/api/reconcile/inputs/station-position` | 受理站点+定位组（multipart：`station_file`、`position_file`） |
+| POST | `/api/reconcile/inputs/swipe` | 受理刷卡组（multipart：`swipe_file`） |
+| GET | `/api/reconcile/status` | 两组版本、当前作业状态、下载可用性 |
+| POST | `/api/reconcile/retry` | 同步推进/重试当前作业一次 |
+| GET | `/api/reconcile/download` | 下载当前版本归站 CSV；不可用时 409 |
+| POST | `/reconcile/upload/station-position`、`/reconcile/upload/swipe`、`/reconcile/retry` | 对应的 HTML 表单入口 |
+| GET | `/samples/{stations,trip_positions,swipes,positions}.csv` | 样例下载 |
+
+输入错误统一返回 `422`，结构与原分析接口一致：
+`{"ok": false, "error": {"code": ..., "message": ..., "details": [...]}}`。
+刷卡相关新增 `code`：`duplicate_transaction_id`、`empty_transaction_id`、
+`empty_trip_id`、`too_many_swipes`。
+
+## 数据持久化
+
+所有输入原文（含文件名、字节数、SHA-256、受理时间）、作业记录与关联表都保存在
+SQLite（默认 `/srv/data/reconcile.db`，可用环境变量 `BUS_RECONCILE_DB` 覆盖）。
+WAL 模式 + `busy_timeout` 支持两个实例并发访问；作业认领用条件 UPDATE 保证
+同一作业同一时刻只被一个 worker 执行。
+
 ## 本地开发与测试
 
 ```bash
@@ -122,14 +242,18 @@ pytest
 
 ```
 app/
-  main.py       FastAPI 路由、错误处理
-  parsing.py    CSV 解码、表头识别、逐行校验
-  models.py     数据模型、上限常量、InputError
-  analysis.py   haversine、窗口枚举、前后缀 DP、事实/待核判定
-  templates/    上传页与结果页
-  static/       样式与前端脚本
-  samples/      可直接试验的样例
-tests/          解析、求值、穷举交叉校验、Web 接口
+  main.py            FastAPI 路由、错误处理、lifespan 与 worker 启动
+  parsing.py         CSV 解码、表头识别、逐行校验（含刷卡与带趟号定位）
+  models.py          数据模型、上限常量、InputError
+  analysis.py        haversine、窗口枚举、前后缀 DP、事实/待核判定
+  association.py     按趟号分组求事实、闭区间归站、未匹配判定
+  storage.py         SQLite 版本/作业/关联表、租约与下载可用性
+  worker.py          后台轮询 worker（多实例互斥认领、失败重试）
+  reconcile_api.py   归站网页与 API 路由
+  templates/         上传页、结果页、归站工作台
+  static/            样式与前端脚本
+  samples/           可直接试验的样例（含 trip_positions、swipes）
+tests/               解析、求值、穷举交叉校验、Web 接口、归站状态机与并发
 ```
 
 ## 设计说明

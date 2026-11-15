@@ -5,3 +5,8 @@ __pycache__/
 venv/
 *.egg-info/
 .git/
+.pydeps/
+app/data/
+*.db
+*.db-wal
+*.db-shm

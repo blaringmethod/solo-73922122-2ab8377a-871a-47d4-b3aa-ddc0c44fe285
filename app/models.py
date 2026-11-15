@@ -9,6 +9,7 @@ from typing import Any, Optional
 # 业务上限（题面约定）
 MAX_STOPS = 6
 MAX_POINTS = 40
+MAX_SWIPES = 100
 MIN_DWELL_POINTS = 2
 
 # 上传与文件限制
@@ -67,6 +68,18 @@ class Position:
     time: datetime  # 带时区，统一为 UTC
     lat: float
     lon: float
+    raw_time: str = ""
+    trip_id: str = ""  # 仅按趟号归站流程使用；原分析入口为空
+
+
+@dataclass(frozen=True)
+class Swipe:
+    """一条刷卡流水，index 为 0 基文件内顺序。"""
+
+    index: int
+    transaction_id: str  # 唯一流水号
+    trip_id: str  # 趟号
+    time: datetime  # 带时区，统一为 UTC
     raw_time: str = ""
 
 

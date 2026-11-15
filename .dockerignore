@@ -3,6 +3,11 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+.pydeps/
 .git/
 tests/
 *.md
+app/data/
+*.db
+*.db-wal
+*.db-shm

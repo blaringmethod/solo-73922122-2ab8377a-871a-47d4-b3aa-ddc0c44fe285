@@ -148,3 +148,16 @@ details summary { cursor: pointer; color: var(--brand); font-size: 13.5px; margi
   table { font-size: 13px; }
   th, td { padding: 7px 6px; }
 }
+
+/* 归站工作台 */
+.nav { margin-top: 8px; display: flex; gap: 16px; }
+.nav .link { color: #dce8f8; }
+.nav .link:hover { color: #ffffff; }
+a.button {
+  display: inline-block; background: var(--brand); color: #fff;
+  padding: 9px 18px; border-radius: 8px; font-size: 14px; text-decoration: none;
+}
+a.button:hover { background: var(--brand-dark); }
+a.button.disabled { opacity: .5; pointer-events: none; background: var(--muted); }
+.rules-list { margin: 0; padding-left: 22px; color: #35405a; }
+.rules-list li { margin-bottom: 6px; }

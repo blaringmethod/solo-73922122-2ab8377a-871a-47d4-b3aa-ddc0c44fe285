@@ -12,8 +12,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-# 以非 root 用户运行
+# 以非 root 用户运行；/srv/data 为两个实例共享的 SQLite 数据卷挂载点
 RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /srv/data \
     && chown -R appuser:appuser /srv
 USER appuser
 

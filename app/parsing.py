@@ -17,10 +17,12 @@ from typing import Optional
 from .models import (
     MAX_POINTS,
     MAX_STOPS,
+    MAX_SWIPES,
     MAX_UPLOAD_BYTES,
     InputError,
     Position,
     Stop,
+    Swipe,
 )
 
 ROLE_LABELS = {
@@ -29,6 +31,8 @@ ROLE_LABELS = {
     "lon": "经度",
     "radius": "半径（米）",
     "time": "UTC 时刻",
+    "transaction_id": "流水号",
+    "trip_id": "趟号",
 }
 
 _BRACKETS_RE = re.compile(r"[\s_\-\.·（）()\[\]【】{}]+")
@@ -149,6 +153,26 @@ def _match_roles(cell: str) -> set[str]:
         or norm in {"name", "stop", "station", "站点", "车站", "名称"}
     ):
         roles.add("name")
+    if (
+        "流水号" in norm
+        or "交易号" in norm
+        or "交易流水" in norm
+        or "transactionid" in norm
+        or "transid" in norm
+        or "txnid" in norm
+        or norm in {"id", "uuid", "流水", "交易编号", "流水编号"}
+    ):
+        roles.add("transaction_id")
+    if (
+        "趟号" in norm
+        or "班次号" in norm
+        or "车次号" in norm
+        or "tripid" in norm
+        or "tripno" in norm
+        or "tripsn" in norm
+        or norm in {"trip", "班次", "车次", "趟次"}
+    ):
+        roles.add("trip_id")
     return roles
 
 
@@ -471,6 +495,106 @@ def _format_time(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
 
 
+def parse_trip_position_csv(
+    data: bytes, *, filename: str = "定位文件"
+) -> tuple[list[Position], list[str]]:
+    """解析带趟号的定位 CSV（按趟号归站流程专用）。
+
+    必需列：趟号、UTC 时刻、纬度、经度。同一趟号内时刻必须严格递增；
+    不同趟号分别校验顺序。总行数上限沿用 MAX_POINTS。
+    """
+
+    label = f"定位文件（{filename}）"
+    text = decode_bytes(data, label=label)
+    rows = _read_rows(text)
+    if not rows:
+        raise InputError(f"{label}没有表头或数据行。", code="empty_file")
+
+    required = ("trip_id", "time", "lat", "lon")
+    _, header_cells = rows[0]
+    warnings: list[str] = []
+    if _looks_like_header(header_cells):
+        mapping, unknown = _resolve_columns(header_cells, required, label=label)
+        data_rows = rows[1:]
+        if unknown:
+            warnings.append(f"{label}忽略了无关列：{'、'.join(unknown)}。")
+        indices = [mapping[role] for role in required]
+    else:
+        data_rows = rows
+        mapping = {role: idx for idx, role in enumerate(required)}
+        indices = list(range(len(required)))
+        if len(header_cells) < len(required):
+            raise InputError(
+                f"{label}未识别到表头，且首行列数不足 {len(required)} 列。"
+                "请提供表头：趟号, 时刻, 纬度, 经度。",
+                code="missing_header",
+            )
+        warnings.append(
+            f"{label}未识别到表头，已按固定列序（趟号, 时刻, 纬度, 经度）解析。"
+        )
+
+    if not data_rows:
+        raise InputError(f"{label}只有表头，没有定位数据行。", code="no_data")
+    if len(data_rows) > MAX_POINTS:
+        raise InputError(
+            f"{label}包含 {len(data_rows)} 个定位点，超过上限 {MAX_POINTS} 个。",
+            code="too_many_points",
+        )
+
+    positions: list[Position] = []
+    max_idx = max(indices)
+    naive_seen = False
+    last_time_by_trip: dict[str, datetime] = {}
+    for (line, raw_cells) in data_rows:
+        cells = _trim_trailing_empty(raw_cells)
+        if len(cells) <= max_idx:
+            raise InputError(
+                f"{label}第 {line} 行只有 {len(cells)} 列，至少需要 {max_idx + 1} 列。",
+                code="row_too_short",
+            )
+        trip_id = _row_get(cells, mapping["trip_id"], label=label, line=line)
+        if not trip_id:
+            raise InputError(f"{label}第 {line} 行趟号为空。", code="empty_trip_id")
+        time, naive = _parse_time(
+            _row_get(cells, mapping["time"], label=label, line=line), label=label, line=line
+        )
+        naive_seen = naive_seen or naive
+        lat = _parse_lat(_row_get(cells, mapping["lat"], label=label, line=line), label=label, line=line)
+        lon = _parse_lon(_row_get(cells, mapping["lon"], label=label, line=line), label=label, line=line)
+
+        previous = last_time_by_trip.get(trip_id)
+        if previous is not None:
+            if time == previous:
+                raise InputError(
+                    f"{label}第 {line} 行（趟号 {trip_id}）时刻与该趟上一行相同"
+                    f"（{_format_time(time)}），同趟定位时刻必须严格递增。",
+                    code="time_not_increasing",
+                )
+            if time < previous:
+                raise InputError(
+                    f"{label}第 {line} 行（趟号 {trip_id}）时刻 {_format_time(time)} "
+                    f"早于该趟上一行 {_format_time(previous)}，同趟定位时刻必须严格递增。",
+                    code="time_not_increasing",
+                )
+        last_time_by_trip[trip_id] = time
+        positions.append(
+            Position(
+                index=len(positions),
+                time=time,
+                lat=lat,
+                lon=lon,
+                raw_time=cells[mapping["time"]].strip(),
+                trip_id=trip_id,
+            )
+        )
+
+    if not positions:
+        raise InputError(f"{label}没有有效定位点。", code="no_data")
+    if naive_seen:
+        warnings.append(f"{label}存在未带时区的时刻，已按 UTC 解释。")
+    return positions, warnings
+
+
 def parse_inputs(
     station_bytes: bytes,
     position_bytes: bytes,
@@ -485,3 +609,93 @@ def parse_inputs(
         positions=positions,
         warnings=stop_warnings + position_warnings,
     )
+
+
+def parse_swipe_csv(data: bytes, *, filename: str = "刷卡文件") -> tuple[list[Swipe], list[str]]:
+    """解析刷卡流水 CSV：必需列为流水号、趟号、UTC 时刻；最多 MAX_SWIPES 条。
+
+    流水号在文件内必须唯一；时刻解析复用通用规则（未带时区按 UTC 解释）。
+    """
+
+    label = f"刷卡文件（{filename}）"
+    text = decode_bytes(data, label=label)
+    rows = _read_rows(text)
+    if not rows:
+        raise InputError(f"{label}没有表头或数据行。", code="empty_file")
+
+    required = ("transaction_id", "trip_id", "time")
+    _, header_cells = rows[0]
+    warnings: list[str] = []
+    if _looks_like_header(header_cells):
+        mapping, unknown = _resolve_columns(header_cells, required, label=label)
+        data_rows = rows[1:]
+        if unknown:
+            warnings.append(f"{label}忽略了无关列：{'、'.join(unknown)}。")
+        indices = [mapping[role] for role in required]
+    else:
+        data_rows = rows
+        mapping = {role: idx for idx, role in enumerate(required)}
+        indices = list(range(len(required)))
+        if len(header_cells) < len(required):
+            raise InputError(
+                f"{label}未识别到表头，且首行列数不足 {len(required)} 列。"
+                "请提供表头：流水号, 趟号, 时刻UTC。",
+                code="missing_header",
+            )
+        warnings.append(
+            f"{label}未识别到表头，已按固定列序（流水号, 趟号, 时刻UTC）解析。"
+        )
+
+    if not data_rows:
+        raise InputError(f"{label}只有表头，没有刷卡数据行。", code="no_data")
+    if len(data_rows) > MAX_SWIPES:
+        raise InputError(
+            f"{label}包含 {len(data_rows)} 条流水，超过单文件上限 {MAX_SWIPES} 条。",
+            code="too_many_swipes",
+        )
+
+    swipes: list[Swipe] = []
+    max_idx = max(indices)
+    seen_ids: dict[str, int] = {}
+    naive_seen = False
+    for (line, raw_cells) in data_rows:
+        cells = _trim_trailing_empty(raw_cells)
+        if len(cells) <= max_idx:
+            raise InputError(
+                f"{label}第 {line} 行只有 {len(cells)} 列，至少需要 {max_idx + 1} 列。",
+                code="row_too_short",
+            )
+        transaction_id = _row_get(
+            cells, mapping["transaction_id"], label=label, line=line
+        )
+        if not transaction_id:
+            raise InputError(f"{label}第 {line} 行流水号为空。", code="empty_transaction_id")
+        trip_id = _row_get(cells, mapping["trip_id"], label=label, line=line)
+        if not trip_id:
+            raise InputError(f"{label}第 {line} 行趟号为空。", code="empty_trip_id")
+        time, naive = _parse_time(
+            _row_get(cells, mapping["time"], label=label, line=line), label=label, line=line
+        )
+        naive_seen = naive_seen or naive
+        if transaction_id in seen_ids:
+            raise InputError(
+                f"{label}流水号“{transaction_id}”重复（第 {seen_ids[transaction_id]} 行与第 "
+                f"{line} 行），流水号必须唯一。",
+                code="duplicate_transaction_id",
+            )
+        seen_ids[transaction_id] = line
+        swipes.append(
+            Swipe(
+                index=len(swipes),
+                transaction_id=transaction_id,
+                trip_id=trip_id,
+                time=time,
+                raw_time=cells[mapping["time"]].strip(),
+            )
+        )
+
+    if not swipes:
+        raise InputError(f"{label}没有有效刷卡流水。", code="no_data")
+    if naive_seen:
+        warnings.append(f"{label}存在未带时区的时刻，已按 UTC 解释。")
+    return swipes, warnings
